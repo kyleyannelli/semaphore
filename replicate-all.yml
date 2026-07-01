@@ -1,18 +1,26 @@
 ---
 # ============================================================================
-#  replicate-all.yml  (self-contained, no role required)
+#  replicate-all.yml  (self-contained, Proxmox VE 9, dry-run-safe)
 #
-#  Enforces a UNIFORM HA policy on a Proxmox VE cluster using local ZFS:
+#  Enforces a UNIFORM HA policy on a Proxmox VE 9 cluster using local ZFS:
 #    * every managed guest is replicated to EVERY other node
-#    * every managed guest joins ONE HA group spanning ALL nodes
+#    * every managed guest is HA-enabled (state=started)
+#
+#  PVE 9 note: HA *groups* were removed in favor of HA rules. But an HA
+#  resource with NO node-affinity rule can already run on ANY node -- which
+#  is exactly "runs anywhere." So we simply enroll each guest as an HA
+#  resource; no group, no rule needed. (A node-affinity rule would only
+#  RESTRICT placement, the opposite of what we want here.)
+#
+#  Read-only lookups use check_mode:false so a --check (Dry Run) still gathers
+#  real state and shows a meaningful plan while making ZERO changes.
 #
 #  Run against ONE node (pmxcfs is cluster-wide, so one node drives it all).
-#  Idempotent + safe to re-run on a schedule so new guests self-heal into
-#  the policy.
+#  Idempotent + safe to re-run on a schedule so new guests self-heal in.
 #
 #  Usage:
 #    ansible-playbook -i inventory.ini replicate-all.yml
-#    ansible-playbook -i inventory.ini replicate-all.yml -e "guests=[200,201]"
+#    ansible-playbook -i inventory.ini replicate-all.yml -e "guests=[100,101]"
 #    ansible-playbook -i inventory.ini replicate-all.yml --check   # dry run
 # ============================================================================
 
@@ -24,15 +32,14 @@
   vars:
     replication_schedule: "*/5"   # min "*/1" (1 min); proxy is config-light
     replication_rate: 0           # MB/s cap; 0 = unlimited (fine on NVMe/LAN)
-    ha_group_name: "all-nodes"
-    ha_nofailback: 1              # stay put after failover; fail back manually
-    guests: []                    # empty = manage ALL guests on ZFS
+    guests: []                    # empty = manage ALL guests
 
   tasks:
     - name: Get cluster node list
       ansible.builtin.command: pvesh get /nodes --output-format json
       register: pve_nodes_raw
       changed_when: false
+      check_mode: false
 
     - name: Parse node names
       ansible.builtin.set_fact:
@@ -47,6 +54,7 @@
       ansible.builtin.command: pvesh get /cluster/resources --type vm --output-format json
       register: pve_resources_raw
       changed_when: false
+      check_mode: false
 
     - name: Build guest list
       ansible.builtin.set_fact:
@@ -62,17 +70,19 @@
       ansible.builtin.debug:
         msg: "Nodes={{ cluster_nodes }} | guests={{ managed_guests | map(attribute='vmid') | list }}"
 
+    # ----- Replication: every guest -> every other node ---------------------
+
     - name: Read existing replication jobs
       ansible.builtin.command: pvesh get /cluster/replication --output-format json
       register: repl_raw
       changed_when: false
+      check_mode: false
 
     - name: Parse existing replication job ids
       ansible.builtin.set_fact:
         existing_jobs: "{{ repl_raw.stdout | from_json | map(attribute='id') | list }}"
 
-    # (guest x every node), skipping the guest's own home node.
-    # Job number = the target node's index in the sorted node list => stable + unique.
+    # Job number = target node's index in the sorted node list => stable + unique.
     - name: Compute desired replication jobs
       ansible.builtin.set_fact:
         desired_jobs: >-
@@ -86,7 +96,7 @@
       loop_control:
         label: "{{ item.0.vmid }} -> {{ item.1 }}"
 
-    - name: Create missing replication jobs (every guest -> every other node)
+    - name: Create missing replication jobs
       ansible.builtin.command: >-
         pvesr create-local-job {{ item.jobid }} {{ item.target }}
         --schedule "{{ replication_schedule }}"
@@ -96,40 +106,25 @@
         label: "{{ item.jobid }} ({{ item.vmid }} -> {{ item.target }})"
       when: item.jobid not in existing_jobs
 
-    - name: Read existing HA groups
-      ansible.builtin.command: pvesh get /cluster/ha/groups --output-format json
-      register: ha_groups_raw
-      changed_when: false
-
-    - name: Create all-nodes HA group if missing
-      ansible.builtin.command: >-
-        ha-manager groupadd {{ ha_group_name }}
-        --nodes "{{ cluster_nodes | join(',') }}"
-        --nofailback {{ ha_nofailback }}
-      when: ha_group_name not in (ha_groups_raw.stdout | from_json | map(attribute='group') | list)
-
-    - name: Ensure HA group spans every node (heal drift if a node was added)
-      ansible.builtin.command: >-
-        ha-manager groupset {{ ha_group_name }}
-        --nodes "{{ cluster_nodes | join(',') }}"
-        --nofailback {{ ha_nofailback }}
-      changed_when: false
+    # ----- HA: enroll each guest as a resource (runs anywhere by default) ----
 
     - name: Read existing HA resources
       ansible.builtin.command: pvesh get /cluster/ha/resources --output-format json
       register: ha_res_raw
       changed_when: false
+      check_mode: false
 
     - name: Parse HA-managed sids
       ansible.builtin.set_fact:
         ha_sids: "{{ ha_res_raw.stdout | from_json | map(attribute='sid') | list }}"
 
     # ha-manager wants ct:<id> for LXCs and vm:<id> for QEMU VMs.
-    - name: Enroll each guest into the all-nodes HA group
+    # No node-affinity rule => PVE 9 lets it run on ANY node (= runs anywhere).
+    - name: Enroll each guest into HA (state started)
       vars:
         sid: "{{ ((item.type == 'lxc') | ternary('ct', 'vm')) ~ ':' ~ (item.vmid | string) }}"
       ansible.builtin.command: >-
-        ha-manager add {{ sid }} --group {{ ha_group_name }} --state started
+        ha-manager add {{ sid }} --state started
       loop: "{{ managed_guests }}"
       loop_control:
         label: "{{ item.type }}:{{ item.vmid }}"
@@ -140,5 +135,5 @@
         msg: >-
           Replicate-all enforced. nodes={{ cluster_nodes | length }},
           guests={{ managed_guests | length }},
-          replication_jobs_desired={{ desired_jobs | default([]) | length }},
-          ha_group='{{ ha_group_name }}'. Re-run to self-heal drift.
+          replication_jobs_desired={{ desired_jobs | default([]) | length }}.
+          HA resources can run on any node (PVE 9 default). Re-run to self-heal.
