@@ -1,0 +1,46 @@
+---
+# ============================================================================
+#  replicate-all.yml
+#
+#  Enforces a UNIFORM HA policy across a Proxmox VE cluster on local ZFS:
+#    * every managed guest is replicated to EVERY other node
+#    * every managed guest belongs to ONE HA group spanning ALL nodes
+#
+#  The point is uniformity: there is no per-guest replica map to remember.
+#  The rule is "everything, everywhere." Pull any 2 nodes and every guest
+#  still has live copies elsewhere to boot from.
+#
+#  Run against ONE node in the cluster (it drives cluster-wide pmxcfs).
+#  Designed to be idempotent + safe to re-run from Semaphore on a schedule
+#  so drift (a new CT that isn't replicated yet) self-heals.
+#
+#  Usage (Semaphore or CLI):
+#    ansible-playbook replicate-all.yml
+#    ansible-playbook replicate-all.yml -e "guests=[200,201]"   # subset
+#    ansible-playbook replicate-all.yml --check                 # dry run
+# ============================================================================
+
+- name: Enforce replicate-all HA policy on Proxmox cluster
+  hosts: pve_primary        # a single node; it drives the whole cluster
+  gather_facts: false
+  become: true
+
+  vars:
+    # Replication cadence. Minimum PVE allows is "*/1" (1 minute).
+    # Config-light guests (a proxy) are fine at 5; bump down for busier ones.
+    replication_schedule: "*/5"
+
+    # Optional bandwidth cap per job in MB/s. 0 = unlimited (fine on NVMe/LAN).
+    replication_rate: 0
+
+    # HA group name + behaviour. nofailback keeps a guest put after failover
+    # instead of flapping back before replication re-converges.
+    ha_group_name: "all-nodes"
+    ha_nofailback: 1
+
+    # Leave `guests` unset to auto-manage EVERY guest whose rootfs/disks are
+    # on a ZFS storage. Override with -e "guests=[200,201]" to scope it.
+    guests: []
+
+  roles:
+    - pve_replicate_all
