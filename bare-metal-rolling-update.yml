@@ -1,232 +1,253 @@
 ---
-# ============================================================================
-#  security-update.yml  -  Rolling security updates across a Proxmox VE 9 cluster
+# bare-metal-rolling-update.yml
 #
-#  Updates all nodes ONE AT A TIME (serial: 1). For each node:
-#    1. verify cluster is quorate (abort if not)
-#    2. enter HA maintenance mode -> HA guests live-migrate to other nodes
-#    3. wait for the node to fully drain (ALL guests, HA or not)
-#    4. apt update + upgrade
-#    5. reboot ONLY if a new kernel was installed (or reboot-required flag)
-#    6. wait for the node to rejoin quorum
-#    7. leave maintenance mode -> guests can return
-#    8. settle, then move to the next node
+# Rolling security updates across the Proxmox cluster, one node at a time.
+# The node currently hosting Semaphore is patched LAST (so the orchestrator
+# only migrates when its own host truly needs a reboot).
 #
-#  any_errors_fatal + serial:1 => if a node fails, the run STOPS before it can
-#  touch (and break) another node. You never lose more than one node at a time,
-#  so quorum and HA stay intact throughout.
+# KEY BEHAVIOUR CHANGE vs. the old version:
+#   * Upgrades run IN PLACE with guests still running.
+#   * A node is drained + rebooted ONLY when a reboot is actually required
+#     (needrestart reports KSTA=3, i.e. a newer kernel is installed).
+#   * Nodes that don't need a reboot are never drained; if only libraries
+#     changed, the affected services are restarted in place (minus a
+#     cluster-critical denylist).
 #
-#  SEMAPHORE-SAFE ORDERING (Option A):
-#    Semaphore runs INSIDE the cluster as an HA guest. If we patched its host
-#    while the task is running there, that node would drain + reboot and kill
-#    the run. So PLAY 1 below discovers which node currently hosts the Semaphore
-#    guest and forces that node to be patched LAST. When the rollout finally
-#    reaches it, HA live-migrates Semaphore to an already-patched node and the
-#    task rides along. Set semaphore_vmid to your Semaphore CT/VM id.
+# REQUIRED:  -e semaphore_vmid=<id>   (CT/VM id of your Semaphore guest)
+# TEST RUN:  -e auto_reboot=false     (does everything except the real reboot)
+# ONE NODE:  --limit drx03            (prove it on a single node first)
 #
-#    (This is the pragmatic option. The fully robust option is to run THIS
-#    pipeline from an off-cluster controller so nothing recurses. See notes.)
-#
-#  Usage:
-#    ansible-playbook -i inventory.ini security-update.yml -e "semaphore_vmid=105"
-#    ansible-playbook -i inventory.ini security-update.yml -e "auto_reboot=false"
-#    ansible-playbook -i inventory.ini security-update.yml --limit drx03   # one node
-# ============================================================================
+# NOTE: routine within-version security updates are safe in place. A MAJOR
+# PVE version upgrade (e.g. 9 -> 10) should still be done by hand with guests
+# drained first -- do not push that through this pipeline.
 
-# ---------------------------------------------------------------------------
-# PLAY 1: discover Semaphore's current host, build an ordered list with that
-#         node moved to the END, and stash it for the rolling play to consume.
-# ---------------------------------------------------------------------------
-- name: "Discover Semaphore host and compute patch order (Semaphore last)"
-  hosts: pve_cluster[0]      # any single node can answer cluster-wide queries
+- name: Discover Semaphore host and compute patch order (Semaphore last)
+  hosts: pve_cluster
   gather_facts: false
+  run_once: true
   become: true
-
   vars:
-    semaphore_vmid: ""       # REQUIRED: your Semaphore CT/VM id, e.g. 105
-
+    semaphore_vmid: ""
   tasks:
-    - name: "Require semaphore_vmid to be set"
+    - name: Require semaphore_vmid to be set
       ansible.builtin.assert:
-        that: semaphore_vmid | string | length > 0
+        that:
+          - semaphore_vmid | string | length > 0
         fail_msg: >-
           Set semaphore_vmid to the CT/VM id of your Semaphore guest, e.g.
-          -e "semaphore_vmid=105". This lets the pipeline patch its host last.
+          -e "semaphore_vmid=100". This lets the pipeline patch its host last.
 
-    - name: "Find which node currently runs the Semaphore guest"
-      ansible.builtin.shell: >-
-        set -o pipefail;
-        pvesh get /cluster/resources --type vm --output-format json |
-        python3 -c "import sys,json;
-        r=[x for x in json.load(sys.stdin) if str(x.get('vmid'))=='{{ semaphore_vmid }}'];
-        print(r[0]['node'] if r else '')"
-      args:
-        executable: /bin/bash
-      register: sema_host
+    - name: Get cluster guest -> node mapping
+      ansible.builtin.command:
+        cmd: pvesh get /cluster/resources --type vm --output-format json
+      register: cluster_resources
       changed_when: false
 
-    - name: "Fail if the Semaphore guest wasn't found in the cluster"
-      ansible.builtin.assert:
-        that: (sema_host.stdout | trim) | length > 0
-        fail_msg: "No guest with vmid={{ semaphore_vmid }} found. Check the id."
+    - name: Find the node currently hosting Semaphore
+      ansible.builtin.set_fact:
+        semaphore_node: >-
+          {{ (cluster_resources.stdout | from_json
+              | selectattr('vmid', 'equalto', semaphore_vmid | int)
+              | map(attribute='node') | list | first | default('')) }}
 
-    - name: "Build patch order: everyone else first, Semaphore's host last"
+    - name: Fail if the Semaphore guest was not found anywhere
+      ansible.builtin.assert:
+        that:
+          - semaphore_node | length > 0
+        fail_msg: "No guest with vmid={{ semaphore_vmid }} found in the cluster."
+
+    - name: Build patch order (all other nodes first, Semaphore host last)
       ansible.builtin.set_fact:
         patch_order: >-
-          {{ (groups['pve_cluster'] | reject('equalto', sema_host.stdout | trim) | list)
-             + [ sema_host.stdout | trim ] }}
+          {{ (groups['pve_cluster'] | difference([semaphore_node])) + [semaphore_node] }}
 
-    - name: "Show computed order"
+    - name: Show the plan
       ansible.builtin.debug:
-        msg: >-
-          Semaphore ({{ semaphore_vmid }}) is on {{ sema_host.stdout | trim }}.
-          Patch order = {{ patch_order }} (its host is last).
+        msg: "Semaphore is on {{ semaphore_node }} -> patch order: {{ patch_order }}"
 
-    # Publish the ordered list to every host so PLAY 2 can key its serial run
-    # off it via a group built at runtime.
-    - name: "Register ordered patch group for the rolling play"
+    - name: Register ordered hosts
       ansible.builtin.add_host:
         name: "{{ item }}"
         groups: pve_ordered
       loop: "{{ patch_order }}"
-      changed_when: false
 
-# ---------------------------------------------------------------------------
-# PLAY 2: the actual rolling update, over the runtime-ordered group so that
-#         Semaphore's host is guaranteed to be the final node touched.
-# ---------------------------------------------------------------------------
-- name: Rolling security updates across Proxmox cluster
+
+- name: Rolling security update (drain + reboot only when a reboot is needed)
   hosts: pve_ordered
-  serial: 1                 # one node at a time -- do NOT change
-  order: inventory          # honor the order PLAY 1 built (Semaphore last)
-  any_errors_fatal: true    # a failure halts the run before the next node
-  max_fail_percentage: 0
-  gather_facts: false
+  gather_facts: true
+  serial: 1
+  order: inventory
+  any_errors_fatal: true
   become: true
-
   vars:
-    # 'dist' = apt full-upgrade (Proxmox's recommended + how security fixes
-    # actually arrive, since PVE packages aren't in a separate security suite).
-    # Use 'safe' for a more conservative upgrade-only.
-    upgrade_mode: dist
-    autoremove: true
-    auto_reboot: true         # reboot when a new kernel landed
-    drain_retries: 60         # 60 x 10s = up to 10 min for guests to migrate off
-    drain_delay: 10
-    reboot_timeout: 900
-
+    auto_reboot: true
+    restart_stale: true
+    upgrade_mode: dist            # dist = apt full-upgrade (Proxmox recommended)
+    # Cluster-critical daemons we never auto-restart from a library update.
+    # If one of these genuinely needs restarting, that's a reboot-worthy event.
+    critical_svc_denylist:
+      - corosync.service
+      - pve-cluster.service
+      - watchdog-mux.service
+      - pvestatd.service
   tasks:
     - name: "Preflight: cluster must be quorate before touching {{ inventory_hostname }}"
-      ansible.builtin.command: pvecm status
-      register: pvecm_pre
+      ansible.builtin.command:
+        cmd: pvecm status
+      register: pvecm
       changed_when: false
-      failed_when: pvecm_pre.stdout is not search('Quorate:\s+Yes')
+      failed_when: >-
+        ('Quorate: Yes' not in pvecm.stdout) and ('Quorate:     Yes' not in pvecm.stdout)
 
-    - name: "Enter HA maintenance mode (drain HA guests off {{ inventory_hostname }})"
-      ansible.builtin.command: "ha-manager crm-command node-maintenance enable {{ inventory_hostname }}"
-      changed_when: true
+    - name: Ensure needrestart is installed (non-interactive)
+      ansible.builtin.apt:
+        name: needrestart
+        state: present
+        update_cache: true
+      environment:
+        NEEDRESTART_MODE: a
+        DEBIAN_FRONTEND: noninteractive
 
-    - name: "Wait for HA guests to drain off {{ inventory_hostname }}"
-      ansible.builtin.shell: >-
-        set -o pipefail;
-        ha-manager status |
-        grep -E '\({{ inventory_hostname }}, (started|migrate|request_start|fence)' || true
-      args:
-        executable: /bin/bash
-      register: ha_drain
-      until: (ha_drain.stdout | trim) == ""
-      retries: "{{ drain_retries }}"
-      delay: "{{ drain_delay }}"
-      changed_when: false
-
-    # HA maintenance ONLY moves HA-managed guests. Verify the node is truly
-    # empty of ALL running guests (qemu + lxc) before we allow a reboot,
-    # so a non-HA guest isn't killed underneath us.
-    - name: "Confirm NO running guests remain on {{ inventory_hostname }}"
-      ansible.builtin.shell: >-
-        set -o pipefail;
-        { qm list 2>/dev/null | awk 'NR>1 && $3=="running"{print "vm:"$1}';
-          pct list 2>/dev/null | awk 'NR>1 && $2=="running"{print "ct:"$1}'; }
-      args:
-        executable: /bin/bash
-      register: running_guests
-      until: (running_guests.stdout | trim) == ""
-      retries: "{{ drain_retries }}"
-      delay: "{{ drain_delay }}"
-      changed_when: false
-      failed_when: false
-
-    # Hard stop: if anything is STILL running here (e.g. a non-HA guest that
-    # maintenance mode won't move), do NOT reboot. Fail this node instead --
-    # any_errors_fatal halts the run so the cluster stays intact.
-    - name: "ABORT if guests are still running on {{ inventory_hostname }} (would be killed by reboot)"
-      ansible.builtin.fail:
-        msg: >-
-          {{ inventory_hostname }} still has running guests that maintenance mode
-          did not migrate: {{ (running_guests.stdout | trim).split('\n') | join(', ') }}.
-          These are likely NOT HA-managed. Enroll them in HA (ha-manager add) or
-          migrate/stop them manually, then re-run. Refusing to reboot.
-      when: (running_guests.stdout | trim) != ""
-
-    - name: "apt update"
+    - name: apt update
       ansible.builtin.apt:
         update_cache: true
-      register: apt_update
-      until: apt_update is succeeded
-      retries: 3
-      delay: 5
+      changed_when: false
 
-    - name: "Apply upgrades (mode={{ upgrade_mode }})"
+    - name: "Apply upgrades (mode={{ upgrade_mode }}) - guests stay running"
       ansible.builtin.apt:
-        upgrade: "{{ upgrade_mode }}"
-        autoremove: "{{ autoremove }}"
+        upgrade: "{{ 'dist' if upgrade_mode == 'dist' else 'safe' }}"
+      environment:
+        NEEDRESTART_MODE: a          # never let the apt hook prompt for input
+        DEBIAN_FRONTEND: noninteractive
       register: upgrade_result
 
-    - name: "Determine whether a reboot is required (new kernel?)"
-      ansible.builtin.shell: |
-        set -e
-        latest=$(ls -1 /boot/vmlinuz-* 2>/dev/null | sed 's|.*/vmlinuz-||' | sort -V | tail -n1)
-        if [ -f /var/run/reboot-required ] || { [ -n "$latest" ] && [ "$(uname -r)" != "$latest" ]; }; then
-          echo REBOOT
-        else
-          echo OK
-        fi
-      args:
-        executable: /bin/bash
-      register: reboot_check
+    - name: Ask needrestart what the upgrade changed (batch, detect only)
+      ansible.builtin.command:
+        cmd: needrestart -b
+      register: nr
       changed_when: false
+      environment:
+        NEEDRESTART_MODE: b          # b = batch/report, do NOT restart anything
 
-    # Reboot only when: auto_reboot enabled AND a new kernel landed AND the
-    # node is confirmed empty of running guests (the abort task above guarantees
-    # we never reach here otherwise, but this makes the guard explicit).
-    - name: "Reboot {{ inventory_hostname }} if required"
-      ansible.builtin.reboot:
-        reboot_timeout: "{{ reboot_timeout }}"
-        post_reboot_delay: 15
+    - name: Parse kernel status (KSTA) and stale services (SVC)
+      ansible.builtin.set_fact:
+        ksta: >-
+          {{ (nr.stdout_lines | select('match', '^NEEDRESTART-KSTA:')
+              | map('regex_replace', '^NEEDRESTART-KSTA:\s*', '')
+              | list | first | default('0')) | int }}
+        stale_services: >-
+          {{ nr.stdout_lines | select('match', '^NEEDRESTART-SVC:')
+             | map('regex_replace', '^NEEDRESTART-SVC:\s*', '')
+             | map('trim') | list }}
+
+    - name: Decide whether a reboot is required
+      # KSTA 3 = a version-upgrade kernel is installed -> reboot required.
+      # KSTA 2 = ABI-compatible upgrade (livepatch-able); without a livepatch
+      #          subscription you'd still want a reboot to run the new kernel,
+      #          so treat >=3 strictly and note 2 in the report.
+      ansible.builtin.set_fact:
+        reboot_needed: "{{ (ksta | int) == 3 }}"
+
+    # -----------------------------------------------------------------
+    # REBOOT PATH -- the ONLY path that drains the node.
+    # -----------------------------------------------------------------
+    - name: Drain and reboot (only when reboot_needed)
+      when: reboot_needed | bool
+      block:
+        - name: "Enter HA maintenance mode (drain HA guests off {{ inventory_hostname }})"
+          ansible.builtin.command:
+            cmd: "ha-manager crm-command node-maintenance enable {{ inventory_hostname }}"
+          changed_when: true
+
+        - name: "Wait for HA guests to drain off {{ inventory_hostname }}"
+          ansible.builtin.shell: >-
+            ha-manager status | awk '/^service /{print}'
+            | grep -w "{{ inventory_hostname }}" || true
+          register: ha_left
+          until: (ha_left.stdout | trim) == ""
+          retries: 30
+          delay: 10
+          changed_when: false
+
+        - name: "Confirm NO running guests remain on {{ inventory_hostname }}"
+          ansible.builtin.shell: |
+            set -o pipefail
+            ( qm  list 2>/dev/null | awk 'NR>1 && $3=="running"{print "vm:"$1}';
+              pct list 2>/dev/null | awk 'NR>1 && $2=="running"{print "ct:"$1}' )
+          args:
+            executable: /bin/bash
+          register: still_running
+          until: (still_running.stdout | trim) == ""
+          retries: 30
+          delay: 10
+          changed_when: false
+
+        - name: "ABORT if guests are still running on {{ inventory_hostname }}"
+          ansible.builtin.fail:
+            msg: >-
+              Refusing to reboot {{ inventory_hostname }}: guests still present ->
+              {{ still_running.stdout_lines }}. Fix the migration, then re-run.
+          when: (still_running.stdout | trim) != ""
+
+        - name: "Reboot {{ inventory_hostname }}"
+          ansible.builtin.reboot:
+            reboot_timeout: 900
+            post_reboot_delay: 30
+          when: auto_reboot | bool
+
+        - name: "auto_reboot=false -> would have rebooted {{ inventory_hostname }}"
+          ansible.builtin.debug:
+            msg: >-
+              DRY REBOOT: {{ inventory_hostname }} needs a reboot (KSTA=3) but
+              auto_reboot=false. Node left drained; not rebooted.
+          when: not (auto_reboot | bool)
+
+        - name: "Wait for {{ inventory_hostname }} to rejoin quorum"
+          ansible.builtin.command:
+            cmd: pvecm status
+          register: pvecm_back
+          until: >-
+            ('Quorate: Yes' in pvecm_back.stdout) or ('Quorate:     Yes' in pvecm_back.stdout)
+          retries: 30
+          delay: 10
+          changed_when: false
+          when: auto_reboot | bool
+
+        - name: "Leave HA maintenance mode on {{ inventory_hostname }}"
+          ansible.builtin.command:
+            cmd: "ha-manager crm-command node-maintenance disable {{ inventory_hostname }}"
+          changed_when: true
+
+    # -----------------------------------------------------------------
+    # NO-REBOOT PATH -- node stays up, guests never move.
+    # Restart only the stale services, minus the cluster-critical denylist.
+    # -----------------------------------------------------------------
+    - name: Restart stale services in place (no drain)
       when:
-        - auto_reboot | bool
-        - reboot_check.stdout == 'REBOOT'
-        - (running_guests.stdout | trim) == ""
+        - not (reboot_needed | bool)
+        - restart_stale | bool
+      vars:
+        services_to_restart: "{{ stale_services | difference(critical_svc_denylist) }}"
+      block:
+        - name: "Restart stale services on {{ inventory_hostname }}"
+          ansible.builtin.systemd:
+            name: "{{ item }}"
+            state: restarted
+          loop: "{{ services_to_restart }}"
+          when: services_to_restart | length > 0
 
-    - name: "Wait for {{ inventory_hostname }} to rejoin quorum"
-      ansible.builtin.command: pvecm status
-      register: pvecm_post
-      until: pvecm_post.stdout is search('Quorate:\s+Yes')
-      retries: 30
-      delay: 10
-      changed_when: false
-
-    - name: "Leave HA maintenance mode on {{ inventory_hostname }}"
-      ansible.builtin.command: "ha-manager crm-command node-maintenance disable {{ inventory_hostname }}"
-      changed_when: true
-
-    - name: "Report"
+    - name: Report
       ansible.builtin.debug:
         msg: >-
-          {{ inventory_hostname }} updated
-          (reboot={{ 'yes' if (auto_reboot | bool and reboot_check.stdout == 'REBOOT') else 'no' }}).
-          Quorum OK. Guests can return.
+          {{ inventory_hostname }}:
+          {% if reboot_needed | bool and auto_reboot | bool %}REBOOTED (new kernel, KSTA=3), quorum OK.
+          {% elif reboot_needed | bool %}NEEDS REBOOT (KSTA=3) but auto_reboot=false -- drained, not rebooted.
+          {% elif (stale_services | difference(critical_svc_denylist) | length) > 0 %}patched in place, restarted: {{ stale_services | difference(critical_svc_denylist) }}.
+          {% else %}patched in place, no reboot, nothing to restart.{% endif %}
+          {% if (ksta | int) == 2 %} [KSTA=2: ABI-compatible kernel pending -- livepatch-able; reboot at your convenience to run it.]{% endif %}
+          {% if (stale_services | intersect(critical_svc_denylist) | length) > 0 %} [cluster-critical services flagged but left alone: {{ stale_services | intersect(critical_svc_denylist) }}]{% endif %}
 
-    - name: "Settle before next node"
+    - name: Settle before next node
       ansible.builtin.pause:
         seconds: 20
+      when: reboot_needed | bool
