@@ -1,0 +1,160 @@
+---
+# ---------------------------------------------------------------------------
+# 1. Discover the cluster: every node name, and where each guest currently lives
+# ---------------------------------------------------------------------------
+
+- name: Get cluster node list
+  ansible.builtin.command: pvesh get /nodes --output-format json
+  register: pve_nodes_raw
+  changed_when: false
+
+- name: Parse node names
+  ansible.builtin.set_fact:
+    cluster_nodes: "{{ pve_nodes_raw.stdout | from_json | map(attribute='node') | list | sort }}"
+
+- name: Fail early if fewer than 2 nodes (nothing to replicate to)
+  ansible.builtin.assert:
+    that: cluster_nodes | length >= 2
+    fail_msg: "Need >=2 nodes for replicate-all; found {{ cluster_nodes }}"
+
+- name: Get all cluster resources (guests + their node placement)
+  ansible.builtin.command: pvesh get /cluster/resources --type vm --output-format json
+  register: pve_resources_raw
+  changed_when: false
+
+- name: Build guest inventory (vmid -> current node, type)
+  ansible.builtin.set_fact:
+    all_guests: >-
+      {{ pve_resources_raw.stdout | from_json
+         | map('combine', {}) | list }}
+
+# If caller passed an explicit guests list, use it; else manage every guest.
+- name: Resolve target guest set
+  ansible.builtin.set_fact:
+    managed_guests: >-
+      {{ all_guests
+         | selectattr('vmid', 'in', guests) | list
+         if (guests | length > 0)
+         else all_guests }}
+
+- name: Show what will be managed
+  ansible.builtin.debug:
+    msg: >-
+      Nodes={{ cluster_nodes }} |
+      Managing guests={{ managed_guests | map(attribute='vmid') | list }}
+
+# ---------------------------------------------------------------------------
+# 2. Replication: for each guest, ensure a job to EVERY node except its own.
+#    Job IDs are deterministic (vmid-<index>) so re-runs are idempotent.
+# ---------------------------------------------------------------------------
+
+- name: Read existing replication jobs
+  ansible.builtin.command: pvesr list --output-format json
+  register: pvesr_existing_raw
+  changed_when: false
+
+- name: Parse existing replication job ids
+  ansible.builtin.set_fact:
+    existing_jobs: "{{ pvesr_existing_raw.stdout | from_json | map(attribute='id') | list }}"
+
+# Flatten (guest x target-node) into a list of desired jobs, skipping the
+# guest's own home node. Index is the target node's position in the sorted
+# node list, guaranteeing a stable unique job number per target.
+- name: Compute desired replication jobs
+  ansible.builtin.set_fact:
+    desired_jobs: >-
+      {{ desired_jobs | default([]) + [{
+           'vmid': item.0.vmid,
+           'home': item.0.node,
+           'target': item.1,
+           'jobid': item.0.vmid ~ '-' ~ (cluster_nodes.index(item.1))
+         }] }}
+  loop: "{{ managed_guests | product(cluster_nodes) | list }}"
+  when: item.1 != item.0.node
+  loop_control:
+    label: "{{ item.0.vmid }} -> {{ item.1 }}"
+
+- name: Create missing replication jobs (replicate every guest to every other node)
+  ansible.builtin.command: >-
+    pvesr create-local-job {{ item.jobid }} {{ item.target }}
+    --schedule "{{ replication_schedule }}"
+    {{ '--rate ' ~ replication_rate if replication_rate | int > 0 else '' }}
+  loop: "{{ desired_jobs }}"
+  loop_control:
+    label: "{{ item.jobid }} ({{ item.vmid }} -> {{ item.target }})"
+  when: item.jobid not in existing_jobs
+  register: created_jobs
+  changed_when: created_jobs is not skipped
+
+- name: Kick initial sync on newly created jobs
+  ansible.builtin.command: "pvesr run {{ item.item.jobid }}"
+  loop: "{{ created_jobs.results | selectattr('changed', 'equalto', true) | list }}"
+  loop_control:
+    label: "{{ item.item.jobid }}"
+  changed_when: true
+  when: created_jobs.results is defined
+
+# ---------------------------------------------------------------------------
+# 3. HA group spanning ALL nodes, then enroll every managed guest into it.
+#    One group, every node, equal priority => "runs anywhere."
+# ---------------------------------------------------------------------------
+
+- name: Read existing HA groups
+  ansible.builtin.command: pvesh get /cluster/ha/groups --output-format json
+  register: ha_groups_raw
+  changed_when: false
+
+- name: Build node string for HA group (all nodes, equal priority)
+  ansible.builtin.set_fact:
+    ha_nodes_str: "{{ cluster_nodes | join(',') }}"
+
+- name: Create all-nodes HA group if missing
+  ansible.builtin.command: >-
+    ha-manager groupadd {{ ha_group_name }}
+    --nodes "{{ ha_nodes_str }}"
+    --nofailback {{ ha_nofailback }}
+  when: ha_group_name not in (ha_groups_raw.stdout | from_json | map(attribute='group') | list)
+  register: ha_group_created
+  changed_when: ha_group_created.rc == 0
+
+- name: Ensure all-nodes HA group spans every node (heal drift if a node was added)
+  ansible.builtin.command: >-
+    ha-manager groupset {{ ha_group_name }}
+    --nodes "{{ ha_nodes_str }}"
+    --nofailback {{ ha_nofailback }}
+  changed_when: false   # groupset is cheap + idempotent; don't spam changed
+
+- name: Read existing HA resources
+  ansible.builtin.command: pvesh get /cluster/ha/resources --output-format json
+  register: ha_resources_raw
+  changed_when: false
+
+- name: Parse HA-managed sids
+  ansible.builtin.set_fact:
+    ha_managed_sids: "{{ ha_resources_raw.stdout | from_json | map(attribute='sid') | list }}"
+
+- name: Enroll each managed guest into the all-nodes HA group
+  ansible.builtin.command: >-
+    ha-manager add {{ item.type }}:{{ item.vmid }}
+    --group {{ ha_group_name }}
+    --state started
+  loop: "{{ managed_guests }}"
+  loop_control:
+    label: "{{ item.type }}:{{ item.vmid }}"
+  when: (item.type ~ ':' ~ item.vmid) not in ha_managed_sids
+  register: ha_enrolled
+  changed_when: ha_enrolled is not skipped
+
+# ---------------------------------------------------------------------------
+# 4. Report
+# ---------------------------------------------------------------------------
+
+- name: Summary
+  ansible.builtin.debug:
+    msg: >-
+      Replicate-all enforced.
+      Nodes={{ cluster_nodes | length }},
+      Guests managed={{ managed_guests | length }},
+      Replication jobs desired={{ desired_jobs | default([]) | length }},
+      HA group='{{ ha_group_name }}' spans all nodes.
+      Re-run anytime to self-heal drift.
