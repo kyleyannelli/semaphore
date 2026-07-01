@@ -106,7 +106,7 @@
         state: present
         update_cache: true
       environment:
-        NEEDRESTART_MODE: a
+        NEEDRESTART_MODE: l          # l = list only: no prompt, no auto-restart
         DEBIAN_FRONTEND: noninteractive
 
     - name: apt update
@@ -118,17 +118,15 @@
       ansible.builtin.apt:
         upgrade: "{{ 'dist' if upgrade_mode == 'dist' else 'safe' }}"
       environment:
-        NEEDRESTART_MODE: a          # never let the apt hook prompt for input
+        NEEDRESTART_MODE: l          # list only: no prompt AND no auto-restart
         DEBIAN_FRONTEND: noninteractive
       register: upgrade_result
 
     - name: Ask needrestart what the upgrade changed (batch, detect only)
       ansible.builtin.command:
-        cmd: needrestart -b
+        cmd: needrestart -b -r l      # -b = machine-readable; -r l = list, restart nothing
       register: nr
       changed_when: false
-      environment:
-        NEEDRESTART_MODE: b          # b = batch/report, do NOT restart anything
 
     - name: Parse kernel status (KSTA) and stale services (SVC)
       ansible.builtin.set_fact:
