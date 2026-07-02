@@ -1,0 +1,133 @@
+---
+# ============================================================================
+#  lxc-security-updates.yml
+#
+#  Applies SECURITY-ONLY updates inside every running LXC, driven from the
+#  hosts via `pct exec` -- no SSH keys or agents inside any guest.
+#
+#  How "security only" is enforced:
+#    We run `unattended-upgrade` (one-shot) inside each container. By default
+#    it applies ONLY packages from the distro security origins
+#    (Debian-Security / Ubuntu -security). That is the distro's own
+#    definition of a security update -- no name-pattern guessing.
+#
+#  Safety properties:
+#    * Read/patch only -- NEVER reboots a container or restarts services
+#      unless reboot_guests=true is passed explicitly.
+#    * Non-apt containers (Alpine, etc.) are detected and skipped, reported.
+#    * Stopped containers are skipped (can't exec into them).
+#    * Every pct exec is wrapped in `timeout` so a wedged CT can't hang the run.
+#    * Hosts run in parallel; CTs on each host run sequentially.
+#
+#  Usage:
+#    normal run:      (no flags)  -> patch + report
+#    also reboot CTs that request it:  -e reboot_guests=true
+#    skip specific CTs:                -e '{"exclude_vmids": [105]}'
+# ============================================================================
+
+- name: Security-only updates inside all running LXCs
+  hosts: pve_cluster
+  gather_facts: false
+  become: true
+
+  vars:
+    reboot_guests: false        # true = `pct reboot` CTs that flag reboot-required
+    exclude_vmids: []           # CT ids to leave alone entirely
+    exec_timeout: 600           # seconds per container before we give up on it
+
+  tasks:
+    - name: List running LXCs on this host
+      ansible.builtin.shell: |
+        set -o pipefail
+        pct list | awk 'NR>1 && $2=="running"{print $1}'
+      args:
+        executable: /bin/bash
+      register: running_cts
+      changed_when: false
+
+    - name: Resolve target containers (running minus excluded)
+      ansible.builtin.set_fact:
+        target_cts: >-
+          {{ running_cts.stdout_lines | map('int') | difference(exclude_vmids | map('int')) | list }}
+
+    - name: "Plan for {{ inventory_hostname }}"
+      ansible.builtin.debug:
+        msg: "CTs to patch here: {{ target_cts }}"
+
+    - name: Apply security updates inside each CT
+      ansible.builtin.shell: |
+        set -uo pipefail
+        ct={{ item }}
+
+        run() { timeout {{ exec_timeout }} pct exec "$ct" -- sh -c "$1"; }
+
+        # 1) Only apt-based distros; skip others cleanly.
+        os_id="$(run 'grep ^ID= /etc/os-release 2>/dev/null | cut -d= -f2 | tr -d \"' || echo unknown)"
+        case "$os_id" in
+          debian|ubuntu) ;;
+          *) echo "RESULT ct=${ct} status=skipped reason=os:${os_id}"; exit 0;;
+        esac
+
+        # 2) Refresh indexes.
+        if ! run 'DEBIAN_FRONTEND=noninteractive apt-get update -qq' >/dev/null 2>&1; then
+          echo "RESULT ct=${ct} status=error reason=apt-update-failed"; exit 1
+        fi
+
+        # 3) Ensure the one-shot security updater exists.
+        run 'command -v unattended-upgrade >/dev/null 2>&1' || \
+          run 'DEBIAN_FRONTEND=noninteractive apt-get install -y -qq unattended-upgrades' >/dev/null 2>&1 || \
+          { echo "RESULT ct=${ct} status=error reason=uu-install-failed"; exit 1; }
+
+        # 4) Dry-run first: list exactly what the security origins would touch.
+        plan="$(run 'unattended-upgrade --dry-run -v 2>&1' || true)"
+        pkgs="$(printf '%s\n' "$plan" | grep -oP '(?<=^Packages that will be upgraded: ).*' | head -n1)"
+
+        if [ -z "${pkgs}" ]; then
+          echo "RESULT ct=${ct} status=clean packages=none"
+        else
+          # 5) Apply for real -- security origins only, non-interactive.
+          if run 'DEBIAN_FRONTEND=noninteractive unattended-upgrade -v' >/dev/null 2>&1; then
+            echo "RESULT ct=${ct} status=patched packages=${pkgs}"
+          else
+            echo "RESULT ct=${ct} status=error reason=upgrade-failed packages=${pkgs}"; exit 1
+          fi
+        fi
+
+        # 6) Report (do not act on) reboot-required.
+        if run 'test -f /var/run/reboot-required'; then
+          echo "REBOOT ct=${ct} required=yes"
+        fi
+        exit 0
+      args:
+        executable: /bin/bash
+      loop: "{{ target_cts }}"
+      loop_control:
+        label: "ct {{ item }}"
+      register: ct_results
+      changed_when: "'status=patched' in ct_results.stdout | default('')"
+      failed_when: ct_results.rc is defined and ct_results.rc != 0
+
+    - name: Collect reboot-required containers
+      ansible.builtin.set_fact:
+        cts_needing_reboot: >-
+          {{ ct_results.results | default([])
+             | map(attribute='stdout', default='') | select('search', 'REBOOT ct=')
+             | map('regex_search', 'REBOOT ct=(\d+)', '\1') | map('first') | list }}
+
+    - name: Reboot containers that requested it (ONLY when reboot_guests=true)
+      ansible.builtin.command: "pct reboot {{ item }}"
+      loop: "{{ cts_needing_reboot }}"
+      when: reboot_guests | bool
+      loop_control:
+        label: "ct {{ item }}"
+
+    - name: "Report for {{ inventory_hostname }}"
+      ansible.builtin.debug:
+        msg: >-
+          {{ ct_results.results | default([])
+             | map(attribute='stdout', default='') | select('search', 'RESULT')
+             | map('regex_search', 'RESULT.*') | list }}
+          {% if cts_needing_reboot | length > 0 %}
+          | reboot-required: {{ cts_needing_reboot }}
+          {%- if not (reboot_guests | bool) %} (NOT rebooted; re-run with -e reboot_guests=true when convenient){% endif %}
+          {% endif %}
