@@ -6,14 +6,18 @@
 #    * every managed guest is replicated to EVERY other node
 #    * every managed guest is HA-enabled (state=started)
 #
-#  PVE 9 note: HA *groups* were removed in favor of HA rules. But an HA
-#  resource with NO node-affinity rule can already run on ANY node -- which
-#  is exactly "runs anywhere." So we simply enroll each guest as an HA
-#  resource; no group, no rule needed. (A node-affinity rule would only
-#  RESTRICT placement, the opposite of what we want here.)
+#  IDEMPOTENCE IS PAIR-BASED, NOT ID-BASED. Proxmox renumbers replication
+#  jobs when a guest migrates (direction-flip), so "does job id X exist"
+#  is the wrong question. The right question is "does ANY job exist for
+#  (guest -> target)". When a pair is missing, we pick a free job number
+#  at runtime instead of assuming one.
 #
-#  Read-only lookups use check_mode:false so a --check (Dry Run) still gathers
-#  real state and shows a meaningful plan while making ZERO changes.
+#  PVE 9 note: HA groups were removed in favor of HA rules. An HA resource
+#  with NO node-affinity rule can already run on ANY node -- exactly "runs
+#  anywhere." So we simply enroll each guest as an HA resource.
+#
+#  Read-only lookups use check_mode:false so a --check (Dry Run) still
+#  gathers real state and shows a meaningful plan while making ZERO changes.
 #
 #  Run against ONE node (pmxcfs is cluster-wide, so one node drives it all).
 #  Idempotent + safe to re-run on a schedule so new guests self-heal in.
@@ -78,33 +82,56 @@
       changed_when: false
       check_mode: false
 
-    - name: Parse existing replication job ids
+    # The unit of truth is the (guest -> target) PAIR. Job ids are Proxmox's
+    # business -- it renumbers them after migrations -- so we never key on them.
+    - name: Parse existing replication (guest -> target) pairs
       ansible.builtin.set_fact:
-        existing_jobs: "{{ repl_raw.stdout | from_json | map(attribute='id') | list }}"
+        existing_pairs: >-
+          {{ repl_raw.stdout | from_json
+             | map(attribute='guest') | map('string') | list
+             | zip(repl_raw.stdout | from_json | map(attribute='target') | list)
+             | map('join', ':') | list }}
 
-    # Job number = target node's index in the sorted node list => stable + unique.
-    - name: Compute desired replication jobs
+    - name: Compute missing (guest -> target) pairs
       ansible.builtin.set_fact:
-        desired_jobs: >-
-          {{ desired_jobs | default([]) + [{
-               'vmid': item.0.vmid,
-               'target': item.1,
-               'jobid': (item.0.vmid | string) ~ '-' ~ (cluster_nodes.index(item.1) | string)
-             }] }}
+        missing_pairs: >-
+          {{ missing_pairs | default([]) + [{ 'vmid': item.0.vmid, 'target': item.1 }] }}
       loop: "{{ managed_guests | product(cluster_nodes) | list }}"
-      when: item.1 != item.0.node
+      when:
+        - item.1 != item.0.node
+        - ((item.0.vmid | string) ~ ':' ~ item.1) not in existing_pairs
       loop_control:
         label: "{{ item.0.vmid }} -> {{ item.1 }}"
 
+    # Pick a free job number AT RUNTIME (live check, immune to renumbering
+    # and to multiple creates for the same guest within this run).
     - name: Create missing replication jobs
-      ansible.builtin.command: >-
-        pvesr create-local-job {{ item.jobid }} {{ item.target }}
-        --schedule "{{ replication_schedule }}"
-        {{ ('--rate ' ~ (replication_rate | string)) if (replication_rate | int) > 0 else '' }}
-      loop: "{{ desired_jobs | default([]) }}"
+      ansible.builtin.shell: |
+        set -euo pipefail
+        vmid="{{ item.vmid }}"
+        target="{{ item.target }}"
+        live_ids="$(pvesh get /cluster/replication --output-format json \
+                    | tr ',' '\n' | grep -o '"id":"[^"]*"' | cut -d'"' -f4)"
+        for n in $(seq 0 31); do
+          id="${vmid}-${n}"
+          if printf '%s\n' "$live_ids" | grep -qx "$id"; then
+            continue
+          fi
+          pvesr create-local-job "$id" "$target" \
+            --schedule "{{ replication_schedule }}" \
+            {{ ('--rate ' ~ (replication_rate | string)) if (replication_rate | int) > 0 else '' }}
+          echo "created ${id} (${vmid} -> ${target})"
+          exit 0
+        done
+        echo "no free job id for guest ${vmid}" >&2
+        exit 1
+      args:
+        executable: /bin/bash
+      loop: "{{ missing_pairs | default([]) }}"
       loop_control:
-        label: "{{ item.jobid }} ({{ item.vmid }} -> {{ item.target }})"
-      when: item.jobid not in existing_jobs
+        label: "{{ item.vmid }} -> {{ item.target }}"
+      register: created_jobs
+      changed_when: "'created' in (created_jobs.stdout | default(''))"
 
     # ----- HA: enroll each guest as a resource (runs anywhere by default) ----
 
@@ -135,5 +162,6 @@
         msg: >-
           Replicate-all enforced. nodes={{ cluster_nodes | length }},
           guests={{ managed_guests | length }},
-          replication_jobs_desired={{ desired_jobs | default([]) | length }}.
+          missing_pairs_created={{ missing_pairs | default([]) | length }}.
+          Idempotence is (guest->target) pair-based; Proxmox owns job ids.
           HA resources can run on any node (PVE 9 default). Re-run to self-heal.
