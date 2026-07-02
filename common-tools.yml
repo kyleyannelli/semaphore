@@ -1,0 +1,65 @@
+---
+# ============================================================================
+#  common-tools.yml
+#
+#  Installs the everyday toolkit on every cluster node. Idempotent, safe to
+#  schedule -- a new/reinstalled node just gets swept in on the next run.
+#
+#  Add packages by editing common_packages below, or one-off:
+#    -e '{"extra_packages": ["ncdu", "iotop"]}'
+# ============================================================================
+
+- name: Install common tools on all nodes
+  hosts: pve_cluster
+  gather_facts: false
+  become: true
+
+  vars:
+    common_packages:
+      - ncdu
+      - iotop
+      - nvme-cli
+      - tmux
+      - vim
+      - btop
+      - htop
+      - lm-sensors      # package is hyphenated; binary is `sensors`
+    extra_packages: []
+
+  tasks:
+    - name: Install common packages
+      ansible.builtin.apt:
+        name: "{{ common_packages + extra_packages }}"
+        state: present
+        update_cache: true
+        cache_valid_time: 3600
+      environment:
+        DEBIAN_FRONTEND: noninteractive
+
+    # lm-sensors is useless until sensors-detect has found the chips.
+    # --auto answers every prompt with the safe default and writes
+    # /etc/sensors3.conf + kernel modules config. Run once per node.
+    - name: Check whether sensors already sees hardware
+      ansible.builtin.command: sensors
+      register: sensors_out
+      changed_when: false
+      failed_when: false
+
+    - name: Run sensors-detect (one-time, safe defaults)
+      ansible.builtin.command: sensors-detect --auto
+      when: sensors_out.rc != 0 or (sensors_out.stdout | trim | length) == 0
+      register: detect_out
+      changed_when: true
+
+    - name: Load detected sensor modules now (no reboot needed)
+      ansible.builtin.service:
+        name: kmod
+        state: restarted
+      when: detect_out is changed
+
+    - name: Report
+      ansible.builtin.debug:
+        msg: >-
+          {{ inventory_hostname }}: tools installed.
+          {% if detect_out is changed %}sensors-detect ran; `sensors` should now show readings.
+          {% else %}sensors already configured.{% endif %}
