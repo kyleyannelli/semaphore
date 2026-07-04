@@ -12,6 +12,12 @@
 #   * Nodes that don't need a reboot are never drained; if only libraries
 #     changed, the affected services are restarted in place (minus a
 #     cluster-critical denylist).
+#   * SELF-EVICTION: if the Semaphore host itself needs a reboot, the play
+#     migrates ct:<semaphore_vmid> to another node FIRST. The restart-migration
+#     stops the container and kills this run on purpose. RE-RUN the task once
+#     Semaphore is back up; discovery re-orders and the old host gets patched
+#     as a normal node. Two runs total, only when the Semaphore host actually
+#     needs a kernel.
 #
 # REQUIRED:  -e semaphore_vmid=<id>   (CT/VM id of your Semaphore guest)
 # TEST RUN:  -e auto_reboot=false     (does everything except the real reboot)
@@ -69,6 +75,8 @@
       ansible.builtin.add_host:
         name: "{{ item }}"
         groups: pve_ordered
+        semaphore_node: "{{ semaphore_node }}"
+        migrate_target: "{{ (groups['pve_cluster'] | difference([semaphore_node])) | first }}"
       loop: "{{ patch_order }}"
 
 
@@ -153,6 +161,30 @@
     - name: Drain and reboot (only when reboot_needed)
       when: reboot_needed | bool
       block:
+        # If this node hosts Semaphore, evict the orchestrator FIRST.
+        # The restart-migration stops ct:<vmid> and kills this run on purpose.
+        # Re-run the task; discovery will see Semaphore on migrate_target and
+        # patch this node as a normal (non-last) node.
+        - name: Self-evict Semaphore before draining its own host
+          when: inventory_hostname == semaphore_node
+          block:
+            - name: Announce self-eviction
+              ansible.builtin.debug:
+                msg: >-
+                  {{ inventory_hostname }} hosts Semaphore (ct:{{ semaphore_vmid }})
+                  and needs a reboot. Migrating ct:{{ semaphore_vmid }} to
+                  {{ migrate_target }}. This run dies with the container.
+                  RE-RUN the task once Semaphore is back up.
+
+            - name: "Migrate ct:{{ semaphore_vmid }} to {{ migrate_target }}"
+              ansible.builtin.command:
+                cmd: "ha-manager crm-command migrate ct:{{ semaphore_vmid }} {{ migrate_target }}"
+              changed_when: true
+
+            - name: Hold until the CT stops and kills this runner
+              ansible.builtin.pause:
+                minutes: 5
+
         - name: "Enter HA maintenance mode (drain HA guests off {{ inventory_hostname }})"
           ansible.builtin.command:
             cmd: "ha-manager crm-command node-maintenance enable {{ inventory_hostname }}"
@@ -213,6 +245,8 @@
           when: auto_reboot | bool
 
         - name: "Leave HA maintenance mode on {{ inventory_hostname }}"
+          # Retried: pmxcfs can lag corosync quorum after reboot, ha-manager
+          # briefly reports "no such cluster node" (bit us on drx03).
           ansible.builtin.command:
             cmd: "ha-manager crm-command node-maintenance disable {{ inventory_hostname }}"
           register: ha_disable
