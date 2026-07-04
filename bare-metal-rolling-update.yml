@@ -215,6 +215,10 @@
         - name: "Leave HA maintenance mode on {{ inventory_hostname }}"
           ansible.builtin.command:
             cmd: "ha-manager crm-command node-maintenance disable {{ inventory_hostname }}"
+          register: ha_disable
+          until: ha_disable.rc == 0
+          retries: 30
+          delay: 10
           changed_when: true
 
     # -----------------------------------------------------------------
